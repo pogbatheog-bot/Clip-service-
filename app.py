@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import subprocess
 import uuid
@@ -18,17 +19,49 @@ def health():
     return jsonify({"status": "ok", "message": "Clip pipeline service is running"})
 
 
-def download_audio_or_video(video_url, job_id, video=True):
-    """Downloads either full video (mp4) or audio-only (for faster transcription)."""
-    ext = "mp4" if video else "mp3"
-    out_path = os.path.join(WORK_DIR, f"{job_id}_source.{ext}")
-    if video:
-        cmd = ["yt-dlp", "-f", "mp4", "-o", out_path, video_url]
-    else:
-        cmd = ["yt-dlp", "-f", "bestaudio", "-x", "--audio-format", "mp3",
-               "-o", out_path, video_url]
-    subprocess.run(cmd, check=True, timeout=900)
+def to_direct_download_link(url):
+    """Converts common Google Drive / Dropbox share links into direct-download links."""
+    drive_match = re.search(r"drive\.google\.com/file/d/([^/]+)", url)
+    if drive_match:
+        file_id = drive_match.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    if "drive.google.com/open?id=" in url:
+        file_id = url.split("id=")[-1].split("&")[0]
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    if "dropbox.com" in url:
+        if "?dl=0" in url:
+            return url.replace("?dl=0", "?dl=1")
+        if "?dl=1" not in url:
+            sep = "&" if "?" in url else "?"
+            return f"{url}{sep}dl=1"
+        return url
+
+    return url  # assume it's already a direct file link
+
+
+def download_file(video_url, job_id):
+    """Downloads a video file directly (Google Drive, Dropbox, or any direct link)."""
+    direct_url = to_direct_download_link(video_url)
+    out_path = os.path.join(WORK_DIR, f"{job_id}_source.mp4")
+
+    with requests.get(direct_url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
     return out_path
+
+
+def extract_audio(video_path, job_id):
+    """Pulls audio out of a downloaded video file as mp3, for transcription."""
+    audio_path = os.path.join(WORK_DIR, f"{job_id}_audio.mp3")
+    cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "libmp3lame", audio_path]
+    subprocess.run(cmd, check=True, timeout=300)
+    return audio_path
 
 
 @app.route("/transcribe", methods=["POST"])
@@ -47,10 +80,12 @@ def transcribe():
         return jsonify({"error": "video_url is required"}), 400
 
     job_id = str(uuid.uuid4())
+    video_path = None
     audio_path = None
 
     try:
-        audio_path = download_audio_or_video(video_url, job_id, video=False)
+        video_path = download_file(video_url, job_id)
+        audio_path = extract_audio(video_path, job_id)
 
         headers = {"authorization": ASSEMBLYAI_API_KEY}
 
@@ -93,6 +128,8 @@ def transcribe():
     except requests.RequestException as e:
         return jsonify({"error": f"AssemblyAI request failed: {str(e)}"}), 500
     finally:
+        if video_path and os.path.exists(video_path):
+            os.remove(video_path)
         if audio_path and os.path.exists(audio_path):
             os.remove(audio_path)
 
@@ -161,7 +198,7 @@ def clip_with_captions():
         return f"{h:02}:{m:02}:{sec:06.3f}"
 
     try:
-        source_path = download_audio_or_video(video_url, job_id, video=True)
+        source_path = download_file(video_url, job_id)
 
         # Write SRT file for this clip's caption window
         srt_content = words_to_srt(words, start_ms)
@@ -198,4 +235,4 @@ def clip_with_captions():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-      
+            
